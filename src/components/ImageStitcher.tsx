@@ -1,6 +1,12 @@
 "use client";
 
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import exifr from "exifr";
 import {
   DndContext,
@@ -21,9 +27,41 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import NextImage from "next/image";
 
+const LS_KEY = "image-stitcher-settings-v1";
+const PRESETS: Record<string, { w: number; h: number } | null> = {
+  none: null,
+  "1080x1920": { w: 1080, h: 1920 },
+  "1920x1080": { w: 1920, h: 1080 },
+  "1242x2208": { w: 1242, h: 2208 },
+};
+// Unified transition classes
+const TRANSITION = "transition-all duration-300 ease-in-out transform-gpu";
+const SHIFT_SHOW = "translate-y-0";
+const SHIFT_HIDE_SM = "-translate-y-1";
+const SHIFT_HIDE_MD = "-translate-y-2";
+
 // {{RIPER-5+SMART-6:
 //   Action: "Parallel-Added"
 //   Task_ID: "nufAT7h5TWBGu6S2axUt4K"
+// Create a rounded-rectangle path
+function roundRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
+) {
+  const radius = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+}
+
 //   Timestamp: "2025-08-13"
 //   Authoring_Subagent: "react-frontend-expert"
 //   Principle_Applied: "SOLID-S (Single Responsibility Principle)"
@@ -137,6 +175,8 @@ function drawWatermark(
     margin?: number;
     scale?: number;
     tile?: boolean;
+    offsetX?: number;
+    offsetY?: number;
   }
 ) {
   const ctx = base.getContext("2d");
@@ -292,6 +332,50 @@ export default function ImageStitcher() {
   const [resultUrl, setResultUrl] = useState<string>("");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  const [useWorker, setUseWorker] = useState<boolean>(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (typeof s.useWorker === "boolean") return s.useWorker;
+      }
+    } catch {}
+    return true;
+  });
+  const workerRef = useRef<Worker | null>(null);
+  // Capability detection: OffscreenCanvas + createImageBitmap
+  useEffect(() => {
+    const g = globalThis as unknown as {
+      OffscreenCanvas?: unknown;
+      createImageBitmap?: unknown;
+    };
+    const okOffscreen = typeof g.OffscreenCanvas === "function";
+    const okCreateImageBitmap = typeof g.createImageBitmap === "function";
+    if (!okOffscreen || !okCreateImageBitmap) {
+      setUseWorker(false);
+      setBanner("当前环境不支持Worker加速，已回退到主线程");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!useWorker) return;
+    if (workerRef.current) return;
+    try {
+      workerRef.current = new Worker(
+        new URL("../workers/stitchWorker.ts", import.meta.url),
+        { type: "module" }
+      );
+    } catch (e) {
+      console.warn("Worker init failed, fallback to main thread", e);
+      workerRef.current = null;
+
+      setUseWorker(false);
+    }
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+  }, [useWorker]);
   // dnd-kit sensors
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -313,6 +397,9 @@ export default function ImageStitcher() {
   const [uniformItemWidth, setUniformItemWidth] = useState<number | "">("");
   const [uniformItemHeight, setUniformItemHeight] = useState<number | "">("");
   const [maxOutputWidth, setMaxOutputWidth] = useState<number | "">(4096);
+  const [borderRadius, setBorderRadius] = useState<number>(0);
+  const [borderWidth, setBorderWidth] = useState<number>(0);
+  const [borderColor, setBorderColor] = useState<string>("#e5e7eb");
   const [maxOutputHeight, setMaxOutputHeight] = useState<number | "">(8192);
   const [wmText, setWmText] = useState<string>("");
   const [wmOpacity, setWmOpacity] = useState<number>(0.2);
@@ -326,8 +413,145 @@ export default function ImageStitcher() {
   const [outerPadding, setOuterPadding] = useState<number>(0);
   const [wmImageDataUrl, setWmImageDataUrl] = useState<string>("");
   const [wmImageScale, setWmImageScale] = useState<number>(0.2);
+  const [wmImageOpacity, setWmImageOpacity] = useState<number>(0.3);
+  const [wmImageOffsetX, setWmImageOffsetX] = useState<number>(0);
+  const [wmImageOffsetY, setWmImageOffsetY] = useState<number>(0);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [progress, setProgress] = useState<number>(0);
+  const [cancelled, setCancelled] = useState<boolean>(false);
+
+  const [banner, setBanner] = useState<string | null>(null);
+
   const cancelRef = useRef<boolean>(false);
+  const nextFrame = useCallback(
+    () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    []
+  );
+  // persist settings
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (s.orientation) setOrientation(s.orientation);
+      if (s.align) setAlign(s.align);
+      if (typeof s.gap === "number") setGap(s.gap);
+      if (typeof s.outerPadding === "number") setOuterPadding(s.outerPadding);
+
+      if (s.bgColor) setBgColor(s.bgColor);
+      if (typeof s.transparentBg === "boolean")
+        setTransparentBg(s.transparentBg);
+      if (s.format) setFormat(s.format);
+      if (typeof s.quality === "number") setQuality(s.quality);
+      if (typeof s.uniformItemWidth === "number" || s.uniformItemWidth === "")
+        setUniformItemWidth(s.uniformItemWidth);
+      if (typeof s.uniformItemHeight === "number" || s.uniformItemHeight === "")
+        setUniformItemHeight(s.uniformItemHeight);
+      if (typeof s.maxOutputWidth === "number" || s.maxOutputWidth === "")
+        setMaxOutputWidth(s.maxOutputWidth);
+      if (typeof s.maxOutputHeight === "number" || s.maxOutputHeight === "")
+        setMaxOutputHeight(s.maxOutputHeight);
+      if (typeof s.wmText === "string") setWmText(s.wmText);
+      if (typeof s.wmOpacity === "number") setWmOpacity(s.wmOpacity);
+      if (typeof s.wmRotate === "number") setWmRotate(s.wmRotate);
+      if (typeof s.wmTile === "boolean") setWmTile(s.wmTile);
+      if (s.wmPosition) setWmPosition(s.wmPosition);
+      if (typeof s.wmImageDataUrl === "string")
+        setWmImageDataUrl(s.wmImageDataUrl);
+      if (typeof s.wmImageScale === "number") setWmImageScale(s.wmImageScale);
+      if (typeof s.wmImageOpacity === "number")
+        setWmImageOpacity(s.wmImageOpacity);
+      if (typeof s.wmImageOffsetX === "number")
+        setWmImageOffsetX(s.wmImageOffsetX);
+      if (typeof s.wmImageOffsetY === "number")
+        setWmImageOffsetY(s.wmImageOffsetY);
+      if (typeof s.gapColor === "string") setGapColor(s.gapColor);
+      if (typeof s.borderRadius === "number") setBorderRadius(s.borderRadius);
+      if (typeof s.borderWidth === "number") setBorderWidth(s.borderWidth);
+      if (typeof s.borderColor === "string") setBorderColor(s.borderColor);
+    } catch (e) {
+      console.warn("restore settings failed", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const s = {
+        orientation,
+        align,
+        gap,
+        outerPadding,
+        bgColor,
+        transparentBg,
+        format,
+        quality,
+        uniformItemWidth,
+        uniformItemHeight,
+        maxOutputWidth,
+        maxOutputHeight,
+        borderRadius,
+        borderWidth,
+        borderColor,
+        useWorker,
+        wmText,
+        wmOpacity,
+        wmRotate,
+        wmTile,
+        wmPosition,
+        wmImageDataUrl,
+        wmImageScale,
+        wmImageOpacity,
+        wmImageOffsetX,
+        wmImageOffsetY,
+        gapColor,
+      };
+      localStorage.setItem(LS_KEY, JSON.stringify(s));
+    } catch (e) {
+      console.warn("persist settings failed", e);
+    }
+  }, [
+    orientation,
+    align,
+    gap,
+    outerPadding,
+    bgColor,
+    transparentBg,
+    format,
+    quality,
+    uniformItemWidth,
+    uniformItemHeight,
+    maxOutputWidth,
+    maxOutputHeight,
+    borderRadius,
+
+    borderWidth,
+    borderColor,
+    wmText,
+    wmOpacity,
+    wmRotate,
+    wmTile,
+    wmPosition,
+    wmImageDataUrl,
+    wmImageScale,
+    wmImageOpacity,
+    wmImageOffsetX,
+    wmImageOffsetY,
+    useWorker,
+
+    gapColor,
+  ]);
+  // Auto-hide UI notices
+  useEffect(() => {
+    if (!cancelled) return;
+    const t = window.setTimeout(() => setCancelled(false), 3000);
+    return () => window.clearTimeout(t);
+  }, [cancelled]);
+  useEffect(() => {
+    if (!banner) return;
+    const t = window.setTimeout(() => setBanner(null), 5000);
+    return () => window.clearTimeout(t);
+  }, [banner]);
 
   function SortableItem({ img, idx }: { img: LoadedImage; idx: number }) {
     const {
@@ -422,7 +646,80 @@ export default function ImageStitcher() {
   const doStitch = useCallback(async () => {
     if (images.length === 0) return;
 
-    // Load all images first
+    setIsProcessing(true);
+    setProgress(0);
+    setCancelled(false);
+    cancelRef.current = false;
+    await nextFrame();
+
+    if (useWorker && workerRef.current) {
+      // Worker pipeline
+      const id = String(Date.now());
+      // store latest id on workerRef for cancel broadcast
+      (workerRef.current as unknown as { __lastTaskId?: string }).__lastTaskId =
+        id;
+      const req = {
+        id,
+        images: images.map((i) => i.dataUrl),
+        options: {
+          orientation,
+          align,
+          gap,
+          gapColor,
+          outerPadding,
+          transparentBg,
+          bgColor,
+          format,
+          quality,
+          uniformItemWidth,
+          uniformItemHeight,
+          maxOutputWidth,
+          maxOutputHeight,
+          borderRadius,
+          borderWidth,
+          borderColor,
+          wmText,
+          wmOpacity,
+          wmRotate,
+          wmPosition,
+          wmTile,
+          wmImageDataUrl,
+          wmImageScale,
+          wmImageOpacity,
+          wmImageOffsetX,
+          wmImageOffsetY,
+        },
+      };
+
+      const w = workerRef.current!;
+      const onMsg = (ev: MessageEvent) => {
+        const msg = ev.data;
+        if (!msg || msg.id !== id) return;
+        if (msg.type === "progress") {
+          setProgress(msg.value);
+        } else if (msg.type === "result") {
+          const url = URL.createObjectURL(msg.blob);
+          setResultUrl(url);
+          setIsProcessing(false);
+          setProgress(1);
+          w.removeEventListener("message", onMsg);
+        } else if (msg.type === "cancelled") {
+          setIsProcessing(false);
+          setProgress(0);
+          setCancelled(true);
+          w.removeEventListener("message", onMsg);
+        } else if (msg.type === "error") {
+          console.error("Worker error:", msg.message);
+          setIsProcessing(false);
+          w.removeEventListener("message", onMsg);
+        }
+      };
+      w.addEventListener("message", onMsg);
+      w.postMessage(req);
+      return;
+    }
+
+    // Load all images first (main thread fallback)
     const els = await Promise.all(images.map((i) => loadImage(i.dataUrl)));
 
     // Compute target dimensions per image (uniform size options)
@@ -500,12 +797,22 @@ export default function ImageStitcher() {
 
     // Draw images (scaled) with alignment
     ctx.save();
+    const total = sized.length;
+    let drawn = 0;
+
     ctx.translate(pad, pad);
+
+    // Optional rounded clip for final content area
+    if (borderRadius > 0) {
+      roundRectPath(ctx, 0, 0, finalW, finalH, borderRadius);
+      ctx.clip();
+    }
 
     // Draw images (scaled) with alignment
     if (orientation === "vertical") {
       let y = 0;
-      for (const it of sized) {
+      for (let i = 0; i < sized.length; i++) {
+        const it = sized[i];
         const dw = Math.max(1, Math.round(it.tw * scale));
         const dh = Math.max(1, Math.round(it.th * scale));
         const x =
@@ -514,12 +821,26 @@ export default function ImageStitcher() {
             : align === "center"
             ? Math.round((finalW - dw) / 2)
             : finalW - dw;
+        if (i > 0 && scaledGap > 0) {
+          ctx.fillStyle = gapColor;
+          ctx.fillRect(0, y, finalW, scaledGap);
+          y += scaledGap;
+        }
         ctx.drawImage(it.img, 0, 0, it.tw, it.th, x, y, dw, dh);
-        y += dh + scaledGap;
+        y += dh;
+        drawn = (i + 1) / total;
+        setProgress(drawn);
+        if (cancelRef.current) {
+          setIsProcessing(false);
+          return;
+        }
+        await nextFrame();
       }
     } else {
       let x = 0;
-      for (const it of sized) {
+
+      for (let i = 0; i < sized.length; i++) {
+        const it = sized[i];
         const dw = Math.max(1, Math.round(it.tw * scale));
         const dh = Math.max(1, Math.round(it.th * scale));
         const y =
@@ -528,8 +849,20 @@ export default function ImageStitcher() {
             : align === "center"
             ? Math.round((finalH - dh) / 2)
             : finalH - dh;
+        if (i > 0 && scaledGap > 0) {
+          ctx.fillStyle = gapColor;
+          ctx.fillRect(x, 0, scaledGap, finalH);
+          x += scaledGap;
+        }
         ctx.drawImage(it.img, 0, 0, it.tw, it.th, x, y, dw, dh);
-        x += dw + scaledGap;
+        x += dw;
+        drawn = (i + 1) / total;
+        setProgress(drawn);
+        if (cancelRef.current) {
+          setIsProcessing(false);
+          return;
+        }
+        await nextFrame();
       }
     }
 
@@ -549,11 +882,13 @@ export default function ImageStitcher() {
       drawWatermark(canvas, {
         type: "image",
         image: wmImg,
-        opacity: wmOpacity,
+        opacity: wmImageOpacity ?? wmOpacity,
         rotateDeg: wmRotate,
         position: wmPosition,
         tile: wmTile,
         scale: wmImageScale,
+        offsetX: wmImageOffsetX,
+        offsetY: wmImageOffsetY,
       });
     }
 
@@ -568,6 +903,8 @@ export default function ImageStitcher() {
       format === "jpeg" ? quality : format === "webp" ? quality : undefined
     );
     setResultUrl(dataUrl);
+    setIsProcessing(false);
+    setProgress(1);
   }, [
     images,
     outerPadding,
@@ -578,10 +915,15 @@ export default function ImageStitcher() {
     align,
     orientation,
     gap,
+    gapColor,
     uniformItemWidth,
     uniformItemHeight,
     maxOutputWidth,
     maxOutputHeight,
+    borderRadius,
+    borderWidth,
+    borderColor,
+    useWorker,
     wmText,
     wmOpacity,
     wmRotate,
@@ -589,6 +931,10 @@ export default function ImageStitcher() {
     wmTile,
     wmImageDataUrl,
     wmImageScale,
+    wmImageOpacity,
+    wmImageOffsetX,
+    wmImageOffsetY,
+    nextFrame,
   ]);
 
   const onDrop = useCallback(
@@ -699,6 +1045,34 @@ export default function ImageStitcher() {
               }
             />
           </div>
+          <div
+            className={`${TRANSITION} ${
+              banner
+                ? `opacity-100 ${SHIFT_SHOW}`
+                : `opacity-0 ${SHIFT_HIDE_MD} pointer-events-none`
+            }`}
+          >
+            <div className="px-3 py-2 rounded bg-amber-50 text-amber-700 border border-amber-200 flex items-center justify-between">
+              <span>{banner}</span>
+              <button
+                className="ml-3 text-amber-700/80 hover:text-amber-900"
+                aria-label="关闭提示"
+                onClick={() => setBanner(null)}
+              >
+                ×
+              </button>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="w-24">间隔线颜色</label>
+            <input
+              type="color"
+              className="border rounded p-1 w-24"
+              value={gapColor}
+              onChange={(e) => setGapColor(e.target.value)}
+              disabled={gap === 0}
+            />
+          </div>
           <div className="flex items-center gap-3">
             <label className="w-24">对齐</label>
             <select
@@ -729,6 +1103,17 @@ export default function ImageStitcher() {
               value={bgColor}
               onChange={(e) => setBgColor(e.target.value)}
             />
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="w-24">使用Worker加速</label>
+            <input
+              type="checkbox"
+              checked={useWorker}
+              onChange={(e) => setUseWorker(e.target.checked)}
+            />
+            <span className="text-xs text-gray-500">
+              不支持时将自动回退主线程
+            </span>
           </div>
           <div className="flex items-center gap-3">
             <label className="w-24">格式</label>
@@ -774,6 +1159,40 @@ export default function ImageStitcher() {
                     </>
                   )}
                 </div>
+                {wmImageDataUrl && (
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <label>图片水印透明度</label>
+                    <input
+                      className="w-40"
+                      type="range"
+                      min={0.05}
+                      max={1}
+                      step={0.01}
+                      value={wmImageOpacity}
+                      onChange={(e) =>
+                        setWmImageOpacity(Number(e.target.value))
+                      }
+                    />
+                    <label>偏移X</label>
+                    <input
+                      className="border rounded p-2 w-24"
+                      type="number"
+                      value={wmImageOffsetX}
+                      onChange={(e) =>
+                        setWmImageOffsetX(Number(e.target.value))
+                      }
+                    />
+                    <label>偏移Y</label>
+                    <input
+                      className="border rounded p-2 w-24"
+                      type="number"
+                      value={wmImageOffsetY}
+                      onChange={(e) =>
+                        setWmImageOffsetY(Number(e.target.value))
+                      }
+                    />
+                  </div>
+                )}
                 <div className="text-xs text-gray-500">
                   WebP 支持透明背景，适合轻量透明图导出。
                 </div>
@@ -799,6 +1218,32 @@ export default function ImageStitcher() {
           )}
           <div className="flex flex-col gap-3">
             <h3 className="font-semibold">尺寸与水印</h3>
+            <div className="flex items-center gap-3">
+              <label className="w-28">社媒预设</label>
+              <select
+                className="border rounded p-2"
+                value={"none"}
+                onChange={(e) => {
+                  const p = PRESETS[e.target.value];
+
+                  if (!p) return;
+                  if (orientation === "vertical") {
+                    setUniformItemWidth(p.w);
+                    setMaxOutputWidth(p.w);
+                    setMaxOutputHeight(p.h);
+                  } else {
+                    setUniformItemHeight(p.h);
+                    setMaxOutputWidth(p.w);
+                    setMaxOutputHeight(p.h);
+                  }
+                }}
+              >
+                <option value="none">无</option>
+                <option value="1080x1920">1080x1920（竖屏）</option>
+                <option value="1920x1080">1920x1080（横屏）</option>
+                <option value="1242x2208">1242x2208（iPhone）</option>
+              </select>
+            </div>
             <div className="flex items-center gap-3">
               <label className="w-28">统一宽度(px)</label>
               <input
@@ -828,6 +1273,35 @@ export default function ImageStitcher() {
                   )
                 }
               />
+              <div className="flex items-center gap-3">
+                <label className="w-28">圆角(px)</label>
+                <input
+                  className="border rounded p-2 w-28"
+                  type="number"
+                  min={0}
+                  value={borderRadius}
+                  onChange={(e) =>
+                    setBorderRadius(Math.max(0, Number(e.target.value)))
+                  }
+                />
+                <label className="w-28">边框宽度(px)</label>
+                <input
+                  className="border rounded p-2 w-28"
+                  type="number"
+                  min={0}
+                  value={borderWidth}
+                  onChange={(e) =>
+                    setBorderWidth(Math.max(0, Number(e.target.value)))
+                  }
+                />
+                <label className="w-28">边框颜色</label>
+                <input
+                  className="border rounded p-1 w-24"
+                  type="color"
+                  value={borderColor}
+                  onChange={(e) => setBorderColor(e.target.value)}
+                />
+              </div>
             </div>
             <div className="flex items-center gap-3">
               <label className="w-28">最大输出宽</label>
@@ -922,13 +1396,52 @@ export default function ImageStitcher() {
             <button
               className="px-3 py-2 rounded bg-black text-white disabled:opacity-50"
               onClick={() => void doStitch()}
-              disabled={images.length === 0}
+              disabled={images.length === 0 || isProcessing}
             >
-              生成
+              {isProcessing ? `生成中… ${Math.round(progress * 100)}%` : "生成"}
             </button>
-            <button className="px-3 py-2 rounded border" onClick={clear}>
-              清空
-            </button>
+            {isProcessing ? (
+              <>
+                <button
+                  className="px-3 py-2 rounded border"
+                  onClick={() => {
+                    if (useWorker && workerRef.current) {
+                      const id =
+                        (
+                          workerRef.current as unknown as {
+                            __lastTaskId?: string;
+                          }
+                        ).__lastTaskId ?? "__latest__";
+                      workerRef.current.postMessage({ id, type: "cancel" });
+                    }
+                    cancelRef.current = true;
+                    setCancelled(true);
+                  }}
+                >
+                  取消
+                </button>
+                <div
+                  className={`flex items-center gap-2 text-xs text-amber-600 ${TRANSITION} ${
+                    cancelled
+                      ? `opacity-100 ${SHIFT_SHOW}`
+                      : `opacity-0 ${SHIFT_HIDE_SM} pointer-events-none`
+                  }`}
+                >
+                  <span>已取消</span>
+                  <button
+                    className="px-1 leading-none rounded hover:bg-amber-100"
+                    aria-label="关闭已取消提示"
+                    onClick={() => setCancelled(false)}
+                  >
+                    ×
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button className="px-3 py-2 rounded border" onClick={clear}>
+                清空
+              </button>
+            )}
           </div>
         </div>
         <div className="flex flex-col gap-2">
@@ -961,6 +1474,47 @@ export default function ImageStitcher() {
                 >
                   清除预览
                 </button>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  className="px-3 py-2 rounded border"
+                  onClick={() => {
+                    try {
+                      const cfg = localStorage.getItem(LS_KEY) ?? "{}";
+                      const blob = new Blob([cfg], {
+                        type: "application/json",
+                      });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = "stitch-config.json";
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    } catch {}
+                  }}
+                >
+                  导出配置
+                </button>
+                <label className="px-3 py-2 rounded border cursor-pointer">
+                  导入配置
+                  <input
+                    type="file"
+                    accept="application/json"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const f = e.target.files?.[0];
+                      if (!f) return;
+                      const text = await f.text();
+                      try {
+                        const s = JSON.parse(text);
+                        localStorage.setItem(LS_KEY, JSON.stringify(s));
+                        location.reload();
+                      } catch {
+                        alert("配置文件无效");
+                      }
+                    }}
+                  />
+                </label>
               </div>
             </>
           ) : (
